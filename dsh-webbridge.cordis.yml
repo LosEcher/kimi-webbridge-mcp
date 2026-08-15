@@ -4,19 +4,20 @@
 #
 # Prerequisites:
 #   1. Kimi WebBridge installed:  ~/.kimi-webbridge/bin/kimi-webbridge status
-#   2. The server file exists at the path below (adjust if you moved it).
-#   3. (runtime) the browser extension is connected — otherwise tools fail
+#   2. (runtime) the browser extension is connected — otherwise tools fail
 #      with "no extension connected" and the model should tell the user.
 #
-# Enable with:  dsh web --patch /Users/echerlos/syncthing/project/dsfolder/kimi-webbridge-mcp/dsh-webbridge.cordis.yml
-# or merge this `insert` into $DSH_HOME/cordis.patch.yml to keep it across runs.
+# Enable by merging this `insert` into $DSH_HOME/cordis.patch.yml (or use
+# `dsh web --patch <path/to/this/file>` for a one-off run). When the bundle
+# is installed via `dsh plugin add`, `command: webbridge-mcp` resolves
+# through the profile's node_modules/.bin; otherwise replace it with
+# `command: node` + `args: ['/absolute/path/to/kimi-webbridge-mcp/server.mjs']`.
 - insert:
     - id: mcp-webbridge
       name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: webbridge
         transport: stdio
-        command: node
-        args: ['/Users/echerlos/syncthing/project/dsfolder/kimi-webbridge-mcp/server.mjs']
+        command: webbridge-mcp
         env:
           WEBBRIDGE_MCP_AUTOSTART: '1'

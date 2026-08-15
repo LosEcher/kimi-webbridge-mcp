@@ -1,9 +1,12 @@
 {
   "name": "kimi-webbridge-mcp",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "description": "MCP stdio server exposing the local Kimi WebBridge daemon (127.0.0.1:10086) as MCP tools — usable from DSH, Claude Code, Codex, and any MCP client.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LosEcher/kimi-webbridge-mcp.git"
+  },
   "bin": {
     "webbridge-mcp": "server.mjs"
   },
@@ -20,7 +23,11 @@
   },
   "files": [
     "server.mjs",
+    "vivaldi-open.mjs",
     "cordis.patch.yml",
-    "README.md"
-  ]
+    "dsh-webbridge.cordis.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT"
 }

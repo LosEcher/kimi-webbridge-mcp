@@ -20,15 +20,16 @@ node test/test-client.mjs --mock
 node test/test-client.mjs
 
 # 3. 任意 MCP 客户端指向这个命令即可：
-node /Users/echerlos/syncthing/project/dsfolder/kimi-webbridge-mcp/server.mjs
+node path/to/kimi-webbridge-mcp/server.mjs   # 或安装后直接 webbridge-mcp
 ```
 
 ## 接入 DSH
 
-用自带的 overlay 补丁（`@deepseek-ai/dsh-mcp-client` 插件，stdio transport）：
+安装 bundle 后用自带的 overlay 补丁（`@deepseek-ai/dsh-mcp-client` 插件，stdio transport）：
 
 ```bash
-dsh web --patch /Users/echerlos/syncthing/project/dsfolder/kimi-webbridge-mcp/dsh-webbridge.cordis.yml
+dsh plugin --profile web add github:LosEcher/kimi-webbridge-mcp#main
+dsh web --patch <path/to/dsh-webbridge.cordis.yml>
 ```
 
 工具以 `mcp__webbridge__<name>` 出现在模型面前（如 `mcp__webbridge__navigate`）。
@@ -95,7 +96,7 @@ dsh web --patch /Users/echerlos/syncthing/project/dsfolder/kimi-webbridge-mcp/ds
   之后一切操作正常。已封装为 `./vivaldi-open.mjs <url> [session]`（见下方示例）。
 
 ```bash
-# Vivaldi 绕行打开页面（替代 navigate(newTab:true)）
+# Vivaldi 绕行打开页面（替代 navigate(newTab:true)）——macOS 专属（AppleScript）
 node vivaldi-open.mjs "https://example.com" my-session
 # → {"ok":true,"tabId":...,"url":"https://example.com","borrowed":true}
 # 然后对 my-session 正常用 evaluate / snapshot / click / navigate(不带 newTab)
