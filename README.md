@@ -97,7 +97,7 @@ dsh web --patch <path/to/dsh-webbridge.cordis.yml>
 
 ```bash
 # Vivaldi 绕行打开页面（替代 navigate(newTab:true)）——macOS 专属（AppleScript）
-node vivaldi-open.mjs "https://example.com" my-session
+node extras/vivaldi-open.mjs "https://example.com" my-session
 # → {"ok":true,"tabId":...,"url":"https://example.com","borrowed":true}
 # 然后对 my-session 正常用 evaluate / snapshot / click / navigate(不带 newTab)
 ```
