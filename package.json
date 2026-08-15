@@ -1,0 +1,26 @@
+{
+  "name": "kimi-webbridge-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP stdio server exposing the local Kimi WebBridge daemon (127.0.0.1:10086) as MCP tools — usable from DSH, Claude Code, Codex, and any MCP client.",
+  "bin": {
+    "webbridge-mcp": "server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test/test-client.mjs --mock"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "server.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}

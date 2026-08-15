@@ -1,0 +1,17 @@
+# kimi-webbridge-mcp bundle patch.
+# Install:  dsh plugin --profile web add link:/path/to/kimi-webbridge-mcp
+# Exposes the local Kimi WebBridge daemon's tools through DSH's MCP bridge as
+# mcp__webbridge__*. Requires the browser extension connected at runtime.
+#
+# The args path below resolves through the profile's flat node_modules
+# (pnpm link: installs a symlink there); adjust if DSH_HOME/profile changes.
+- insert:
+    - id: mcp-webbridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: webbridge
+        transport: stdio
+        command: node
+        args: ['/Users/echerlos/.dsh/profiles/web/node_modules/kimi-webbridge-mcp/server.mjs']
+        env:
+          WEBBRIDGE_MCP_AUTOSTART: '1'

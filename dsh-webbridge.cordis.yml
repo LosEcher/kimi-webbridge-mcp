@@ -1,0 +1,22 @@
+# Opt-in overlay: expose the local Kimi WebBridge daemon's tools to DSH
+# through @deepseek-ai/dsh-mcp-client. The model sees them as
+# `mcp__webbridge__navigate`, `mcp__webbridge__snapshot`, ... .
+#
+# Prerequisites:
+#   1. Kimi WebBridge installed:  ~/.kimi-webbridge/bin/kimi-webbridge status
+#   2. The server file exists at the path below (adjust if you moved it).
+#   3. (runtime) the browser extension is connected — otherwise tools fail
+#      with "no extension connected" and the model should tell the user.
+#
+# Enable with:  dsh web --patch /Users/echerlos/syncthing/project/dsfolder/kimi-webbridge-mcp/dsh-webbridge.cordis.yml
+# or merge this `insert` into $DSH_HOME/cordis.patch.yml to keep it across runs.
+- insert:
+    - id: mcp-webbridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: webbridge
+        transport: stdio
+        command: node
+        args: ['/Users/echerlos/syncthing/project/dsfolder/kimi-webbridge-mcp/server.mjs']
+        env:
+          WEBBRIDGE_MCP_AUTOSTART: '1'
