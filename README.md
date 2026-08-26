@@ -96,11 +96,23 @@ dsh web --patch <path/to/dsh-webbridge.cordis.yml>
   之后一切操作正常。已封装为 `./vivaldi-open.mjs <url> [session]`（见下方示例）。
 
 ```bash
-# Vivaldi 绕行打开页面（替代 navigate(newTab:true)）——macOS 专属（AppleScript）
-node extras/vivaldi-open.mjs "https://example.com" my-session
-# → {"ok":true,"tabId":...,"url":"https://example.com","borrowed":true}
+# Vivaldi 绕行打开页面（替代 navigate(newTab:true)）——跨平台首选（cdp Target.createTarget）
+# macOS 自动用 osascript 探测锚标签；Windows/远程需 --anchor（用户当前活跃标签 URL）
+node extras/open-tab.mjs "https://example.com" my-session
+node extras/open-tab.mjs "https://example.com" my-session --anchor "https://weibo.com" --daemon "http://127.0.0.1:10087"  # Win 经隧道
+# → {"ok":true,"tabId":...,"url":"https://example.com","borrowed":true,"method":"create"}
 # 然后对 my-session 正常用 evaluate / snapshot / click / navigate(不带 newTab)
+
+# 旧方案（macOS 专属 AppleScript 建标签，已被 open-tab.mjs 取代，保留兼容）
+node extras/vivaldi-open.mjs "https://example.com" my-session
 ```
+
+> **原理**：webbridge 的 `cdp` 工具（chrome.debugger 透传）支持 `Target.createTarget`，
+> 由浏览器原生创建标签（秒级，不经过扩展的 load 事件等待），返回 targetId 后再
+> `find_tab {url, active:true}` 借用。2026-08-16 MBP + Win 双机实测：Vivaldi 下
+> `navigate(newTab:true)` 必现 30s 超时，而 createTarget 方案两平台都秒级可用。
+> 注意：cdp 要求 session 已有 tab（需先借锚标签）；`Target.getTargets`/`attachToTarget`
+> 被扩展拒绝，只能用 createTarget → find_tab 组合。
 
 ## 安全注意
 
