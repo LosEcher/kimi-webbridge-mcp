@@ -12,5 +12,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Mock smoke tests (no daemon/browser)
-        run: node test/test-client.mjs --mock
+      - name: Browser-free gates (syntax + unit + fake-daemon MCP smoke)
+        run: bash test/gates.sh

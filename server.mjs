@@ -6,42 +6,48 @@
  * Zero dependencies: plain Node >= 18, newline-delimited JSON-RPC 2.0 over
  * stdio (the same framing Claude Code / Codex / DSH mcp-client use).
  *
- * Daemon contract (v1.11.x):
- *   POST /command  { action, args, session } -> JSON
- *   success: { ok: true, ...result }  |  { ok: true, data: {...} }
- *   failure: { ok: false, error: { code, message } }  (HTTP 502)
+ * Tool families
+ *   fast loop  obs / act / open_tab — one atomic observation, guarded execution,
+ *              and a tab lifecycle that never depends on `navigate`.
+ *   legacy     navigate / snapshot / click / fill / evaluate / cdp / screenshot /
+ *              network / upload / save_as_pdf / list_tabs / close_tab /
+ *              close_session / find_tab / webbridge_status — unchanged, still
+ *              the escape hatch for frames, shadow DOM, dialogs and uploads.
  *
  * Environment:
- *   WEBBRIDGE_DAEMON_URL          daemon base URL          (default http://127.0.0.1:10086)
- *   WEBBRIDGE_DAEMON_BIN          daemon CLI for autostart (default ~/.kimi-webbridge/bin/kimi-webbridge)
- *   WEBBRIDGE_MCP_TIMEOUT_MS      per-call timeout         (default 60000)
- *   WEBBRIDGE_MCP_AUTOSTART       '1' start daemon on connection failure (default '1')
- *   WEBBRIDGE_MCP_DEFAULT_SESSION default tab-group session (default webbridge-mcp)
- *   WEBBRIDGE_MCP_MOCK            '1' canned responses, no daemon/browser (testing)
+ *   WEBBRIDGE_DAEMON_URL             daemon base URL           (default http://127.0.0.1:10086)
+ *   WEBBRIDGE_DAEMON_BIN             daemon CLI for autostart  (default ~/.kimi-webbridge/bin/kimi-webbridge)
+ *   WEBBRIDGE_MCP_TIMEOUT_MS         default per-call budget   (default 60000)
+ *   WEBBRIDGE_MCP_AUTOSTART          '1' start the daemon on connection failure (default '1')
+ *   WEBBRIDGE_MCP_DEFAULT_SESSION    default tab-group session (default webbridge-mcp)
+ *   WEBBRIDGE_MCP_MOCK               '1' canned/fake daemon, no browser (testing)
+ *   WEBBRIDGE_MCP_DEBUG              '1' per-step diagnostics on stderr
+ *   WEBBRIDGE_MCP_OBS_MAX_CHARS      obs model-facing char budget (default 4000)
+ *   WEBBRIDGE_MCP_OBS_MAX_ELEMENTS   obs element cap              (default 120)
+ *   WEBBRIDGE_MCP_OBS_TEXT_CHARS     obs visible-text cap         (default 1200)
+ *   WEBBRIDGE_MCP_OBS_TIMEOUT_MS     obs page read budget         (default 15000)
+ *   WEBBRIDGE_MCP_ACT_TIMEOUT_MS     act precondition-check budget (default 10000)
+ *   WEBBRIDGE_MCP_ACT_INPUT_TIMEOUT_MS  act input/verify budget  (default 8000)
  */
 
 import { createInterface } from 'node:readline'
-import { spawn } from 'node:child_process'
-import { setTimeout as sleep } from 'node:timers/promises'
-import { homedir } from 'node:os'
+import { readConfig, createDaemonClient } from './lib/daemon.mjs'
+import { createObsStore } from './lib/refs.mjs'
+import { createSessionGuard } from './lib/sessions.mjs'
+import { createObsHandler } from './lib/obs.mjs'
+import { createActHandler } from './lib/act.mjs'
+import { openTab } from './lib/tabs.mjs'
+import { createMockCall } from './lib/mock-daemon.mjs'
 
 const PROTOCOL_VERSION = '2024-11-05'
 const MAX_RESULT_TEXT = 1_000_000
 const MAX_ERROR_TEXT = 500
 
-const cfg = {
-  daemonUrl: (process.env.WEBBRIDGE_DAEMON_URL || 'http://127.0.0.1:10086').replace(/\/+$/, ''),
-  daemonBin: process.env.WEBBRIDGE_DAEMON_BIN || `${homedir()}/.kimi-webbridge/bin/kimi-webbridge`,
-  timeoutMs: Number(process.env.WEBBRIDGE_MCP_TIMEOUT_MS || 60_000),
-  autostart: (process.env.WEBBRIDGE_MCP_AUTOSTART ?? '1') !== '0',
-  defaultSession: process.env.WEBBRIDGE_MCP_DEFAULT_SESSION || 'webbridge-mcp',
-  mock: (process.env.WEBBRIDGE_MCP_MOCK ?? '0') === '1',
-}
+const cfg = readConfig()
 
 // ── Tool catalog ────────────────────────────────────────────────────────────
-// Session rules (from the kimi-webbridge skill): one task = one session = one
-// tab group. Pass the same session on every call of a task; name it after the
-// task. group_title (human label, user's language) goes on the FIRST navigate.
+// Session rules: one task = one session = one tab group. Pass the same session
+// on every call of a task; name it after the task.
 
 const SESSION_ARG = {
   type: 'string',
@@ -50,14 +56,79 @@ const SESSION_ARG = {
 
 const TOOLS = [
   {
+    name: 'obs',
+    description:
+      'Observe the current tab in ONE round trip: a compact indexed element table (ref/kind/role/name/value) plus visible text and scroll state. ' +
+      'Each element gets an opaque ref (e.g. o3:17) that stays valid while that element keeps its meaning — prefer acting on these refs over CSS selectors. ' +
+      'The payload is budget-capped (default 4000 chars) and truncation is reported in `omitted`/`truncated`. ' +
+      'Prefer obs over snapshot: snapshot returns the full accessibility tree (tens of thousands of characters) and its @e refs are positional.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        max_chars: { type: 'integer', description: 'Model-facing character budget (default 4000).' },
+        max_elements: { type: 'integer', description: 'Maximum elements to list (default 120).' },
+        text_chars: { type: 'integer', description: 'Maximum visible-text characters (default 1200).' },
+        include_rect: { type: 'boolean', description: 'Include each element rect (default false; geometry is re-resolved at act time anyway).' },
+        keep_alive: { type: 'boolean', description: 'Set false to skip arming focus emulation on a background tab (default: arm it when the page reports itself hidden).' },
+        session: SESSION_ARG,
+      },
+    },
+  },
+  {
+    name: 'act',
+    description:
+      'Act on a ref from obs, with a guard: before dispatching anything the element is re-checked in one page call (still attached? enabled? visible? on-screen? uncovered? still the same role/name/value/surrounding text?). ' +
+      'If anything changed, act REFUSES and dispatches NO input, returning stale:true + no_input_dispatched:true + the exact change (plus a fresh observation). ' +
+      'If it still matches, real trusted input is dispatched via CDP (Input.dispatchMouseEvent / Input.insertText / Input.dispatchKeyEvent) and delivery is verified. ' +
+      'Geometry is always re-resolved at act time, so an element that merely moved is still hit. ' +
+      'kind: click (default), fill (needs text), press (needs key: Enter/Tab/Escape/ArrowUp/ArrowDown/Backspace/Delete/Space), select (needs value).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ref: { type: 'string', description: 'Element ref from obs, e.g. o3:17.' },
+        kind: { type: 'string', enum: ['click', 'fill', 'press', 'select'], description: 'Action kind (default click).' },
+        text: { type: 'string', description: 'Text for kind=fill ("" clears the field).' },
+        key: { type: 'string', enum: ['Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp', 'Backspace', 'Delete', 'Space'], description: 'Key for kind=press.' },
+        value: { type: 'string', description: 'Option value for kind=select.' },
+        settle_ms: { type: 'integer', description: 'Bounded settle after dispatch, in ms (default 40).' },
+        verify_delivery: { type: 'boolean', description: 'Verify that the pointer event actually reached the intended element (default true).' },
+        refresh: { type: 'boolean', description: 'On a drift/detached refusal, include a fresh observation in the response (default true).' },
+        session: SESSION_ARG,
+      },
+      required: ['ref'],
+    },
+  },
+  {
+    name: 'open_tab',
+    description:
+      'Open a URL in a background tab and make it the session\u2019s working tab, WITHOUT using navigate. ' +
+      'navigate waits on the extension\u2019s load callback (measured p50 24 s, and it can hang unbounded), so this is the reliable way to start a task. ' +
+      'The tab is created by the browser (cdp Target.createTarget, milliseconds), identified by tab-id diff (never by hostname matching), kept in the background so the user\u2019s visible tab does not switch, and armed for keep-alive. ' +
+      'Returns ready/ready_state/waited_ms or an honest failure with created:true when the browser made a tab the session could not bind.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'URL to open (http/https).' },
+        reuse: { type: 'boolean', description: 'Reuse a matching tab already in this session (default true).' },
+        can_create: { type: 'boolean', description: 'Allow the last-resort background tab creation when the session owns no tab (default true). Set false to forbid creating tabs entirely.' },
+        ready_timeout_ms: { type: 'integer', description: 'Readiness budget in ms (default 5000).' },
+        anchor: { type: 'string', description: 'URL of a tab to borrow as the CDP anchor when the session owns no tab (default: discover the foreground tab on macOS).' },
+        session: SESSION_ARG,
+      },
+      required: ['url'],
+    },
+  },
+  {
     name: 'navigate',
     description:
-      'Open a URL in the user\u2019s real browser (Kimi WebBridge) and make it the current tab. First call of a task: pass newTab:true and a human-readable group_title in the user\u2019s language. Omit newTab to send the current tab to the URL.',
+      'Open a URL in the user\u2019s real browser (Kimi WebBridge) and make it the current tab. ' +
+      'WARNING: on some browsers the new-tab path never answers (the extension wraps a 30 s timer around a 300 s CDP call), so this call is budgeted and may report a timeout — prefer open_tab for opening pages. ' +
+      'Omit newTab to send the already-borrowed tab to the URL (that path is fast and safe).',
     inputSchema: {
       type: 'object',
       properties: {
         url: { type: 'string', description: 'Full URL to open.' },
-        newTab: { type: 'boolean', description: 'Open in a new tab (default false). Use true when pages should coexist.' },
+        newTab: { type: 'boolean', description: 'Open in a new tab (default false). Prefer open_tab when true.' },
         group_title: { type: 'string', description: 'Visible label for this task\u2019s tab group; set on the first navigate of a task, in the user\u2019s language.' },
         session: SESSION_ARG,
       },
@@ -67,7 +138,8 @@ const TOOLS = [
   {
     name: 'find_tab',
     description:
-      'Re-select a tab this session opened. Pass the exact full URL from list_tabs/navigate (a bare root domain may miss a www.* tab). active:true borrows the tab the user is currently viewing (operates it in place, borrowed:true).',
+      'Re-select a tab this session opened. Pass the exact full URL from list_tabs/open_tab. ' +
+      'Note: matching is by HOSTNAME, so a same-host tab can be selected by mistake — verify the returned url/tabId. active:true borrows the tab the user is currently viewing (operates it in place, borrowed:true).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -81,12 +153,13 @@ const TOOLS = [
   {
     name: 'snapshot',
     description:
-      'Read the current tab\u2019s accessibility tree (text) to inspect the page and locate elements. Returns @e refs usable as selectors for click/fill — prefer them over hand-written CSS. Use after navigate and after page changes.',
+      'Read the current tab\u2019s accessibility tree (text) — the full-tree escape hatch, useful for iframes/shadow DOM/canvas that obs does not reach. ' +
+      'Returns @e refs usable as selectors for click/fill, but those refs are POSITIONAL and are renumbered by every snapshot: never reuse an @e ref across snapshots. Prefer obs + act.',
     inputSchema: { type: 'object', properties: { session: SESSION_ARG } },
   },
   {
     name: 'click',
-    description: 'Click an element in the current tab. selector: an @e ref from snapshot or a CSS selector. Use the submit button to submit forms (no Enter tool).',
+    description: 'Click an element in the current tab (legacy path, no guard). selector: an @e ref from snapshot or a CSS selector. Prefer obs + act, which refuse stale targets instead of silently mis-clicking.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -99,7 +172,7 @@ const TOOLS = [
   {
     name: 'fill',
     description:
-      'Fill an input/textarea or [contenteditable] rich editor (ProseMirror/TipTap/Lexical/Slate). Clear-and-insert: existing content is replaced; append by reading the current value via evaluate, concatenating, then filling.',
+      'Fill an input/textarea or [contenteditable] rich editor (legacy path, no guard). Clear-and-insert: existing content is replaced. Prefer obs + act kind=fill, which verifies the value landed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -113,7 +186,8 @@ const TOOLS = [
   {
     name: 'evaluate',
     description:
-      'Run JavaScript in the current tab (async/await supported). Wrap declarations in an IIFE so repeated calls do not hit redeclare errors; keep return payloads compact (JSON.stringify without formatting).',
+      'Run JavaScript in the current tab (async/await supported). Wrap declarations in an IIFE so repeated calls do not hit redeclare errors; keep return payloads compact (JSON.stringify without formatting). ' +
+      'Note: a background tab throttles its own timers/rAF, so do not run long in-page loops — obs/act already arm focus emulation to avoid that.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -125,7 +199,7 @@ const TOOLS = [
   },
   {
     name: 'cdp',
-    description: 'Raw chrome.debugger (CDP) passthrough. Low-level escape hatch when the other tools do not cover a case (e.g. trusted input events). method: CDP domain.method, params: method arguments.',
+    description: 'Raw chrome.debugger (CDP) passthrough. Low-level escape hatch when the other tools do not cover a case (e.g. trusted input events). method: CDP domain.method, params: method arguments. Requires the session to already own a tab.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -200,7 +274,7 @@ const TOOLS = [
   },
   {
     name: 'close_tab',
-    description: 'Close the current tab of the session.',
+    description: 'Close the current (working) tab of the session. Use only on tabs this session opened — a borrowed user tab is still the user\u2019s tab.',
     inputSchema: { type: 'object', properties: { session: SESSION_ARG } },
   },
   {
@@ -216,130 +290,78 @@ const TOOLS = [
   },
 ]
 
-// ── Daemon transport ────────────────────────────────────────────────────────
+// ── Wiring ──────────────────────────────────────────────────────────────────
 
-function parseErrorBody(raw) {
-  try {
-    const body = JSON.parse(raw)
-    if (body && body.ok === false && body.error) {
-      return `webbridge ${body.error.code ?? 'error'}: ${body.error.message ?? raw.slice(0, MAX_ERROR_TEXT)}`
+const daemon = createDaemonClient({
+  ...cfg,
+  mockCall: cfg.mock ? createMockCall() : undefined,
+})
+const store = createObsStore()
+const guard = createSessionGuard()
+const obs = createObsHandler({ call: daemon.call, store, cfg, guard })
+const act = createActHandler({ call: daemon.call, store, cfg, obs, guard })
+
+/** Tools implemented by this server itself (not a straight daemon passthrough). */
+async function callNative(name, args, session) {
+  if (name === 'obs') return obs(args, session)
+  if (name === 'act') return act(args, session)
+  if (name === 'open_tab') {
+    return openTab(daemon.call, session, {
+      url: args.url,
+      reuse: args.reuse !== false,
+      canCreate: args.can_create !== false,
+      readyTimeoutMs: args.ready_timeout_ms ?? 5000,
+      anchorUrl: args.anchor,
+      userTabProbe: cfg.mock ? () => ({ via: 'mock', url: 'https://mock.test/anchor' }) : undefined,
+      guard,
+      debug: cfg.debug,
+    })
+  }
+  if (name === 'webbridge_status') return daemon.status()
+  if (name === 'close_session') {
+    const res = await daemon.callWithAutostart('close_session', args, session)
+    if (res.ok) {
+      store.forget(session)
+      guard.forget(session)
     }
-  } catch { /* not JSON */ }
+    return res
+  }
   return null
 }
 
-async function callDaemon(action, args, session) {
-  if (cfg.mock) return mockResult(action, args)
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), cfg.timeoutMs)
-  try {
-    let res
-    try {
-      res = await fetch(`${cfg.daemonUrl}/command`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action, args, session }),
-        signal: controller.signal,
-      })
-    } catch (error) {
-      throw new ConnectionError(`kimi-webbridge daemon unreachable at ${cfg.daemonUrl} (${error.cause?.code ?? error.message})`)
-    }
-    const raw = await res.text()
-    const parsed = parseErrorBody(raw)
-    if (parsed) throw new Error(parsed)
-    if (!res.ok) throw new Error(`kimi-webbridge daemon HTTP ${res.status}: ${raw.slice(0, MAX_ERROR_TEXT)}`)
-    try {
-      const body = JSON.parse(raw)
-      if (body && typeof body === 'object') {
-        const { ok, error, ...rest } = body
-        return rest.data !== undefined ? rest.data : rest
-      }
-      return { raw }
-    } catch {
-      return { raw: raw.slice(0, MAX_RESULT_TEXT) }
-    }
-  } finally {
-    clearTimeout(timer)
+/**
+ * Legacy passthrough tools still change which tab the session works on, so the
+ * guard is updated here: a successful navigate/find_tab binds the session, and
+ * closing the working tab leaves it unknown.
+ */
+function noteTabBinding(name, args, session, value) {
+  if (name === 'find_tab' && value?.success !== false) {
+    guard.bind(session, { url: value?.url ?? args.url, source: 'find_tab', borrowed: value?.borrowed === true })
+    if (value?.borrowed === true) guard.markAnchor(session, value?.tabId)
+  } else if (name === 'navigate' && value?.success !== false) {
+    guard.bind(session, { url: value?.url ?? args.url, source: 'navigate' })
+  } else if (name === 'close_tab' && value?.closed === true) {
+    guard.unbind(session, { reason: 'the working tab was closed', source: 'close_tab' })
   }
 }
 
-class ConnectionError extends Error {}
-
-/** Real status surface is the CLI (`kimi-webbridge status` prints JSON) — the
- * daemon has no health endpoint and no webbridge_status command action. */
-async function daemonStatus() {
-  if (cfg.mock) return mockResult('webbridge_status', {})
-  return new Promise((resolve, reject) => {
-    const child = spawn(cfg.daemonBin, ['status'], { stdio: ['ignore', 'pipe', 'pipe'] })
-    const timeout = setTimeout(() => {
-      child.kill()
-      reject(new Error('kimi-webbridge status timed out'))
-    }, 5000)
-    let out = ''
-    let err = ''
-    child.stdout.on('data', (d) => { out += d })
-    child.stderr.on('data', (d) => { err += d })
-    child.on('error', (e) => {
-      clearTimeout(timeout)
-      reject(new ConnectionError(`cannot run ${cfg.daemonBin}: ${e.message}`))
-    })
-    child.on('close', (code) => {
-      clearTimeout(timeout)
-      if (code === 0) {
-        try {
-          resolve(JSON.parse(out))
-        } catch {
-          reject(new Error(`kimi-webbridge status returned non-JSON: ${out.slice(0, MAX_ERROR_TEXT)}`))
-        }
-      } else {
-        reject(new Error(`kimi-webbridge status exited ${code}: ${err.slice(0, MAX_ERROR_TEXT)}`))
-      }
-    })
-  })
-}
-
-async function callWithAutostart(action, args, session) {
-  try {
-    return await callDaemon(action, args, session)
-  } catch (error) {
-    if (cfg.autostart && error instanceof ConnectionError) {
-      process.stderr.write(`[webbridge-mcp] daemon unreachable; starting ${cfg.daemonBin} ...\n`)
-      try {
-        spawn(cfg.daemonBin, ['start'], { detached: true, stdio: 'ignore' }).unref()
-        await sleep(1800)
-      } catch (startError) {
-        process.stderr.write(`[webbridge-mcp] autostart failed: ${startError.message}\n`)
-      }
-      return await callDaemon(action, args, session) // second attempt, errors propagate
+async function callTool(name, args, session) {
+  const native = await callNative(name, args, session)
+  if (native !== null) return native
+  const res = await daemon.callWithAutostart(name, args, session)
+  if (!res.ok) {
+    const error = new Error(`webbridge ${res.error?.code ?? 'error'}: ${res.error?.message ?? 'unknown'}`)
+    if (res.timedOut) {
+      error.timedOut = true
+      error.message = `${name} timed out after ${res.budgetMs} ms — ` +
+        (name === 'navigate'
+          ? 'navigate waits on the extension\u2019s load callback and can hang for minutes; use open_tab instead (it reuses or navigates a tab you already own, or borrows the tab in front). '
+          : 'the effect is UNKNOWN: re-read page state (obs/find_tab) before retrying. ')
     }
     throw error
   }
-}
-
-// ── Mock mode (WEBBRIDGE_MCP_MOCK=1): deterministic responses, no daemon ────
-
-function mockResult(action, args) {
-  const a = args ?? {}
-  const results = {
-    navigate: () => ({ success: true, url: a.url, tabId: 'mock-tab-1', mock: true }),
-    find_tab: () => ({ success: true, url: a.url, tabId: 'mock-tab-1', borrowed: Boolean(a.active), mock: true }),
-    snapshot: () => ({ url: 'about:blank', title: 'mock', tree: '<html><body><button @e1>Example</button></body></html>', mock: true }),
-    click: () => ({ success: true, tag: 'button', text: 'Example', mock: true }),
-    fill: () => ({ success: true, tag: 'input', mode: 'value', mock: true }),
-    evaluate: () => ({ type: 'string', value: 'mock-eval-result', mock: true }),
-    cdp: () => ({ mock: true }),
-    screenshot: () => ({ format: a.format ?? 'png', path: '/tmp/webbridge-mock.png', sizeBytes: 0, mimeType: 'image/png', mock: true }),
-    network: () => ({ mock: true, events: [] }),
-    upload: () => ({ success: true, fileCount: Array.isArray(a.files) ? a.files.length : 0, mock: true }),
-    save_as_pdf: () => ({ path: '/tmp/webbridge-mock.pdf', sizeBytes: 0, mimeType: 'application/pdf', pageTitle: 'mock', mock: true }),
-    list_tabs: () => ({ success: true, tabs: [{ tabId: 'mock-tab-1', url: 'about:blank', title: 'mock', active: true, groupTitle: 'mock' }], mock: true }),
-    close_tab: () => ({ success: true, closed: true, mock: true }),
-    close_session: () => ({ success: true, closed: 1, mock: true }),
-    webbridge_status: () => ({ running: true, extension_connected: true, mock: true, version: 'v1.11.5' }),
-  }
-  const make = results[action]
-  if (!make) throw new Error(`Unknown webbridge action: ${action}`)
-  return make()
+  noteTabBinding(name, args, session, res.data)
+  return res.data
 }
 
 // ── MCP JSON-RPC over stdio ─────────────────────────────────────────────────
@@ -360,7 +382,7 @@ async function handle(message) {
     return rpcResult(message.id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: 'kimi-webbridge-mcp', version: '1.0.0' },
+      serverInfo: { name: 'kimi-webbridge-mcp', version: '1.1.0' },
     })
   }
   if (message.method === 'ping') return rpcResult(message.id, {})
@@ -374,9 +396,7 @@ async function handle(message) {
     const session = typeof args.session === 'string' && args.session.length > 0 ? args.session : cfg.defaultSession
     const { session: _drop, ...toolArgs } = args
     try {
-      const value = name === 'webbridge_status'
-        ? await daemonStatus()
-        : await callWithAutostart(name, toolArgs, session)
+      const value = await callTool(name, toolArgs, session)
       return rpcResult(message.id, { content: [{ type: 'text', text: JSON.stringify(value) }] })
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error)
@@ -391,7 +411,7 @@ async function handle(message) {
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 
-process.stderr.write(`[webbridge-mcp] ready (daemon: ${cfg.daemonUrl}${cfg.mock ? ' [MOCK]' : ''}, session default: ${cfg.defaultSession})\n`)
+process.stderr.write(`[webbridge-mcp] ready v1.1.0 (daemon: ${cfg.daemonUrl}${cfg.mock ? ' [MOCK]' : ''}, session default: ${cfg.defaultSession})\n`)
 
 const lines = createInterface({ input: process.stdin })
 for await (const line of lines) {

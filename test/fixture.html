@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>webbridge fast-loop fixture</title>
+<style>
+  body { font: 13px/1.4 system-ui, sans-serif; margin: 12px; max-width: 900px; }
+  header nav a { margin-right: 12px; }
+  form { display: grid; grid-template-columns: 130px 240px; gap: 4px 10px; align-items: center; }
+  label { display: contents; }
+  #results { list-style: none; padding: 0; margin: 8px 0; }
+  #results li { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid #eee; }
+  #ac { position: absolute; background: #fff; border: 1px solid #ccc; width: 220px; }
+  #ac [role="option"] { padding: 3px 8px; cursor: pointer; }
+  #status { font-weight: 600; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <nav>
+    <a href="#home">Home</a>
+    <a href="#deals">Deals</a>
+    <a href="#help">Help</a>
+    <a href="#account">Account</a>
+  </nav>
+</header>
+
+<main>
+  <h1>Search</h1>
+  <form id="search" onsubmit="return false">
+    <label>Where from?<input id="from" placeholder="City"></label>
+    <label>Where to?<input id="to" placeholder="City" autocomplete="off"></label>
+    <label>Departure<input id="date" type="date"></label>
+    <label>Passengers
+      <select id="pax" aria-label="Passengers">
+        <option>1 adult</option><option>2 adults</option><option>3 adults</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="nonstop"> Nonstop only</label>
+    <label><input type="checkbox" id="refundable"> Refundable</label>
+    <span><button id="go" type="button">Search</button>
+    <button id="reset" type="reset">Reset</button></span>
+  </form>
+  <p id="status">idle</p>
+
+  <div id="banner-slot"></div>
+
+  <h2>Results</h2>
+  <ul id="results"></ul>
+  <button id="probe">Probe</button>
+  <div style="height: 1400px"></div>
+  <button id="offscreen">Below the fold</button>
+</main>
+
+<script>
+  // ── probes used by the E2E assertions ─────────────────────────────────────
+  window.__rafTicks = 0;
+  (function tick() { window.__rafTicks++; requestAnimationFrame(tick); })();
+  window.__clicks = { any: 0, trusted: 0, dom: 0, lastTrusted: null };
+  window.__last = null;        // text of the last clicked element
+  window.__keys = [];          // keydown keys seen
+  window.__events = [];        // input/change events seen
+
+  document.addEventListener('click', (e) => {
+    window.__clicks.any++;
+    if (e.isTrusted) window.__clicks.trusted++; else window.__clicks.dom++;
+    window.__clicks.lastTrusted = e.isTrusted;
+    window.__last = (e.target.textContent || '').trim().slice(0, 40);
+  }, true);
+  document.addEventListener('keydown', (e) => { window.__keys.push(e.key); }, true);
+  for (const t of ['input', 'change']) document.addEventListener(t, (e) => {
+    window.__events.push({ type: t, id: e.target.id || null, value: e.target.value ?? null, trusted: e.isTrusted });
+  }, true);
+
+  document.getElementById('go').addEventListener('click', () => {
+    document.getElementById('status').textContent = 'searched';
+  });
+  document.getElementById('probe').addEventListener('click', () => {
+    const el = document.getElementById('probe');
+    el.dataset.clicks = String(Number(el.dataset.clicks || 0) + 1);
+  });
+
+  // ── mutation helpers (used to make observations stale on purpose) ─────────
+  window.__renameGo = (text) => {
+    const b = document.getElementById('go');
+    b.textContent = text;
+    b.setAttribute('aria-label', text);
+    return text;
+  };
+  window.__insertSpacer = (px) => {
+    const s = document.createElement('div');
+    s.style.height = px + 'px';
+    document.getElementById('search').before(s);
+    return px;
+  };
+  window.__shift = (n = 3) => {
+    const slot = document.getElementById('banner-slot');
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < n; i++) {
+      const b = document.createElement('button');
+      b.textContent = 'Banner action ' + i;
+      frag.append(b);
+    }
+    slot.append(frag);
+    return n;
+  };
+  window.__removeGo = () => { document.getElementById('go').remove(); return true; };
+  window.__reset = () => {
+    window.__clicks = { any: 0, trusted: 0, dom: 0, lastTrusted: null };
+    window.__last = null; window.__keys = []; window.__events = [];
+    return true;
+  };
+
+  // delayed autocomplete (for pre-scroll/settle experiments)
+  const to = document.getElementById('to');
+  to.addEventListener('input', () => {
+    setTimeout(() => {
+      let list = document.getElementById('ac');
+      if (!list) {
+        list = document.createElement('div');
+        list.id = 'ac';
+        list.setAttribute('role', 'listbox');
+        to.parentElement.append(list);
+      }
+      list.innerHTML = '';
+      for (const c of ['London', 'Londonderry', 'Longyearbyen']) {
+        const o = document.createElement('div');
+        o.setAttribute('role', 'option');
+        o.textContent = c;
+        list.append(o);
+      }
+    }, 120);
+  });
+
+  for (let i = 1; i <= 40; i++) {
+    const li = document.createElement('li');
+    const span = document.createElement('span');
+    span.textContent = 'Flight F' + String(i).padStart(3, '0') + ' — 216 USD — 1 stop';
+    const btn = document.createElement('button');
+    btn.textContent = 'Select flight ' + i;
+    li.append(span, btn);
+    document.getElementById('results').append(li);
+  }
+  window.__totalActions = document.querySelectorAll('a[href],button,input,textarea,select,[role]').length;
+</script>
+</body>
+</html>

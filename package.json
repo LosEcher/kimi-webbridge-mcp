@@ -1,8 +1,8 @@
 {
   "name": "kimi-webbridge-mcp",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "type": "module",
-  "description": "MCP stdio server exposing the local Kimi WebBridge daemon (127.0.0.1:10086) as MCP tools — usable from DSH, Claude Code, Codex, and any MCP client.",
+  "description": "MCP stdio server exposing the local Kimi WebBridge daemon (127.0.0.1:10086) as MCP tools — guarded obs/act fast loop plus the full legacy tool surface; usable from DSH, Claude Code, Codex, and any MCP client.",
   "repository": {
     "type": "git",
     "url": "https://github.com/LosEcher/kimi-webbridge-mcp.git"
@@ -14,7 +14,10 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/test-client.mjs --mock"
+    "test": "node --test test/unit.test.mjs",
+    "test:mock": "node test/mcp-smoke.mjs --mock",
+    "test:e2e": "node test/e2e-live.mjs",
+    "gates": "bash test/gates.sh"
   },
   "dsh": {
     "bundle": {
@@ -23,7 +26,10 @@
   },
   "files": [
     "server.mjs",
+    "lib/",
+    "test/",
     "extras/vivaldi-open.mjs",
+    "extras/open-tab.mjs",
     "cordis.patch.yml",
     "dsh-webbridge.cordis.yml",
     "README.md",
