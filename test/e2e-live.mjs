@@ -300,6 +300,67 @@ try {
   assert('act: a decision is invalidated by navigation/reload', afterReload.value?.executed === false && afterReload.value?.stale === true, `${afterReload.value?.reason_code}: ${afterReload.value?.reason}`)
   assert('act: nothing was clicked after the reload', JSON.parse(await evalJs('JSON.stringify(window.__clicks)')).any === 0, 'zero clicks')
 
+  // ── 10b. O-E: an off-screen target is scrolled into view ONCE, then clicked ─
+  assert('fixture: reload before the off-screen case', await reloadAndWait(), 'fresh document')
+  await evalJs('window.__reset()')
+  page = await observe({})
+  const belowFold = refOf(page.value, (e) => e.name === 'Below the fold', 'Below the fold')
+  const scrollYBefore = Number(await evalJs('scrollY'))
+  const scrolled = await mcp.tool('act', { ref: belowFold, kind: 'click' })
+  const afterFold = JSON.parse(await evalJs('JSON.stringify({scrollY, status: document.getElementById("status").textContent, last: window.__last, clicks: window.__clicks})'))
+  evidence.raw.act_offscreen = scrolled.value
+  assert('act: an off-screen target is scrolled into view once and then executed',
+    scrolled.value?.executed === true && scrolled.value?.scroll_attempts === 1,
+    `scroll_attempts=${scrolled.value?.scroll_attempts} from=${JSON.stringify(scrolled.value?.scrolled?.from)} to=${JSON.stringify(scrolled.value?.scrolled?.to)}`)
+  assert('act: the click landed on the element below the fold',
+    afterFold.last === 'Below the fold' && afterFold.clicks.trusted >= 1,
+    `last="${afterFold.last}" trusted=${afterFold.clicks.trusted}`)
+  assert('act: the page really scrolled to it', afterFold.scrollY > scrollYBefore, `scrollY ${scrollYBefore} → ${afterFold.scrollY}`)
+
+  // ── 10c. O-G: verify decides whether the task is actually done ───────────
+  const clicksBeforeVerify = afterFold.clicks.any
+  const passedVerify = await mcp.tool('verify', {
+    checks: [
+      { name: 'url', url: { op: 'prefix', value: PAGE } },
+      { name: 'status says the fold was reached', text: { op: 'contains', value: 'reached the fold', selector: '#status' } },
+      { name: 'search button', element: { css: '#go', op: 'present' } },
+      { name: 'result rows', count: { css: '#results li', op: 'gte', value: 40 } },
+    ],
+  })
+  evidence.raw.verify_pass = passedVerify.value
+  assert('verify: a satisfied checklist passes',
+    passedVerify.value?.passed === true && passedVerify.value?.verdict === 'PASS',
+    `failed=${JSON.stringify(passedVerify.value?.failed)} checks=${passedVerify.value?.checks?.length}`)
+
+  const failedVerify = await mcp.tool('verify', { checks: [{ name: 'one too many', count: { css: '#results li', op: 'gte', value: 999 } }] })
+  evidence.raw.verify_fail = failedVerify.value
+  assert('verify: an unsatisfied check FAILS with expected/actual (not an error)',
+    failedVerify.value?.ok === true && failedVerify.value?.passed === false && (failedVerify.value?.failed ?? []).includes('one too many'),
+    `check=${JSON.stringify(failedVerify.value?.checks?.[0])}`)
+  assert('verify: nothing was clicked while verifying',
+    JSON.parse(await evalJs('JSON.stringify(window.__clicks)')).any === clicksBeforeVerify,
+    'zero input dispatched')
+
+  const ledgerRead = await mcp.tool('ledger', { limit: 50 })
+  evidence.raw.ledger = ledgerRead.value
+  const ledgerEntries = ledgerRead.value?.entries ?? []
+  assert('ledger: dispatched actions and verify verdicts are on record',
+    ledgerEntries.some((e) => e.phase === 'verify' && e.verdict === 'pass') &&
+    ledgerEntries.some((e) => e.phase === 'verify' && e.verdict === 'fail') &&
+    ledgerEntries.some((e) => e.phase === 'outcome' && e.verdict === 'ok'),
+    `${ledgerEntries.length} entries, unresolved=${(ledgerRead.value?.unresolved ?? []).length}`)
+
+  // ── 10d. O-E: scroll:false refuses instead of moving the page ────────────
+  assert('fixture: reload before the scroll:false case', await reloadAndWait(), 'fresh document')
+  await evalJs('window.__reset()')
+  page = await observe({})
+  const belowFold2 = refOf(page.value, (e) => e.name === 'Below the fold', 'Below the fold')
+  const refusedScroll = await mcp.tool('act', { ref: belowFold2, kind: 'click', scroll: false })
+  evidence.raw.act_offscreen_no_scroll = refusedScroll.value
+  assert('act: scroll:false refuses an off-screen target with zero input',
+    refusedScroll.value?.reason_code === 'outside_viewport' && refusedScroll.value?.no_input_dispatched === true,
+    `${refusedScroll.value?.reason_code} scroll_mode=${refusedScroll.value?.scroll_mode}`)
+
   // ── 11. cleanup: close only the tab this test created ───────────────────
   // Two layers, because a crashed run must not leave fixture tabs behind:
   //   1. the API path — bind the tab, verify its URL is ours, close it;

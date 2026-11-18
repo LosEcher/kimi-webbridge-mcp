@@ -97,7 +97,7 @@ try {
   const names = tools.map((t) => t.name)
   for (const expected of ['navigate', 'find_tab', 'snapshot', 'click', 'fill', 'evaluate', 'cdp',
     'screenshot', 'network', 'upload', 'save_as_pdf', 'list_tabs', 'close_tab', 'close_session',
-    'webbridge_status', 'obs', 'act', 'open_tab']) {
+    'webbridge_status', 'obs', 'act', 'open_tab', 'verify', 'ledger']) {
     assert(names.includes(expected), `tool present: ${expected}`)
   }
   for (const t of tools) {
@@ -161,7 +161,31 @@ try {
     assert(refused.fresh && refused.fresh.obs, 'the refusal carries a fresh observation')
     const clicksAfter = (await readState()).clicks.any
     assert(clicksBefore === clicksAfter, `no click happened on a refused act (${clicksBefore} -> ${clicksAfter})`)
-    console.log('PASS obs/act/open_tab fast-loop flow (mock)')
+
+    // verify (O-G): a checked outcome, and a failed check that is NOT an error
+    const verified = JSON.parse(toolResultText(await rpc('tools/call', {
+      name: 'verify',
+      arguments: {
+        session,
+        checks: [
+          { name: 'url', url: { op: 'prefix', value: 'https://mock.test' } },
+          { name: 'search present', element: { css: '[name="Search"]', op: 'present' } },
+          { name: 'never true', text: { op: 'contains', value: 'this text is not on the page' } },
+        ],
+      },
+    })).text)
+    assert(verified.ok === true && verified.passed === false, 'verify reports a failed check as a successful verification', JSON.stringify(verified).slice(0, 240))
+    assert(verified.failed.includes('never true'), 'the failing check is named', JSON.stringify(verified.failed))
+    const invalidVerify = JSON.parse(toolResultText(await rpc('tools/call', { name: 'verify', arguments: { session, checks: [] } })).text)
+    assert(invalidVerify.passed === false && invalidVerify.unknown === true, 'an empty checklist is UNKNOWN, never a pass', JSON.stringify(invalidVerify).slice(0, 200))
+
+    // ledger (O-F): the trail is readable, and the verify verdicts are on it
+    const led = JSON.parse(toolResultText(await rpc('tools/call', { name: 'ledger', arguments: { session, limit: 50 } })).text)
+    assert(led.ok === true && Array.isArray(led.entries), 'ledger returns entries', JSON.stringify(led).slice(0, 200))
+    assert(led.entries.some((e) => e.phase === 'verify'), 'the verify verdict is recorded in the ledger')
+    assert(led.entries.some((e) => e.phase === 'outcome' && e.verdict === 'ok'), 'a landed action is recorded as an outcome')
+    assert(Array.isArray(led.unresolved) && led.unresolved.length === 0, 'nothing is left unresolved after clean actions')
+    console.log('PASS obs/act/open_tab + verify/ledger fast-loop flow (mock)')
 
     // the session guard: closing the working tab untrusts the session, the next
     // obs refuses (without reading any page), and open_tab re-binds.

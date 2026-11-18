@@ -1,6 +1,6 @@
 {
   "name": "kimi-webbridge-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "MCP stdio server exposing the local Kimi WebBridge daemon (127.0.0.1:10086) as MCP tools — guarded obs/act fast loop plus the full legacy tool surface; usable from DSH, Claude Code, Codex, and any MCP client.",
   "repository": {

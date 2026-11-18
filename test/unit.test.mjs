@@ -11,6 +11,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   createObsStore, guardDiff, summarizeDiff, pageKeyChanged, describePageKeyChange,
@@ -20,7 +23,9 @@ import { buildObsPayload, DEFAULT_LIMITS } from '../lib/payload.mjs'
 import { urlMatches, urlIdentity, readyStateOk, pollUntil, parseUrl } from '../lib/readiness.mjs'
 import { resolveBudget, parseErrorBody, createDaemonClient, ACTION_BUDGETS } from '../lib/daemon.mjs'
 import { createObsHandler } from '../lib/obs.mjs'
-import { createActHandler, KEYS } from '../lib/act.mjs'
+import { createActHandler, KEYS, scrollIntoViewCode } from '../lib/act.mjs'
+import { createVerifyHandler, validateChecks, CHECK_KINDS } from '../lib/verify.mjs'
+import { createOpsLedger, createLedgerIndex } from '../lib/ledger.mjs'
 import { openTab } from '../lib/tabs.mjs'
 import { createMockCall } from '../lib/mock-daemon.mjs'
 import { createSessionGuard } from '../lib/sessions.mjs'
@@ -33,10 +38,11 @@ const guard = (over = {}) => ({
   ariaSelected: null, href: null, scope: 'Search form', ...over,
 })
 
-function harness({ mock = createMockCall(), cfg: overrides = {}, withGuard = false } = {}) {
+function harness({ mock = createMockCall(), cfg: overrides = {}, withGuard = false, ledger = createOpsLedger({ path: null }) } = {}) {
   const cfg = {
     debug: false, mock: true, timeoutMs: 5000,
-    obsTimeoutMs: 5000, actCheckTimeoutMs: 5000, actInputTimeoutMs: 5000,
+    obsTimeoutMs: 5000, actCheckTimeoutMs: 5000, actScrollTimeoutMs: 5000, actInputTimeoutMs: 5000,
+    verifyTimeoutMs: 5000, ledgerPath: null,
     obsMaxChars: DEFAULT_LIMITS.maxChars, obsMaxElements: DEFAULT_LIMITS.maxElements,
     obsTextChars: DEFAULT_LIMITS.textChars,
     ...overrides,
@@ -50,8 +56,9 @@ function harness({ mock = createMockCall(), cfg: overrides = {}, withGuard = fal
     return daemon.call(action, args, session, opts)
   }
   const obs = createObsHandler({ call, store, cfg, guard: withGuard ? guard : null })
-  const act = createActHandler({ call, store, cfg, obs, guard: withGuard ? guard : null })
-  return { cfg, daemon, store, guard, calls, call, obs, act, session: 'unit' }
+  const act = createActHandler({ call, store, cfg, obs, guard: withGuard ? guard : null, ledger })
+  const verify = createVerifyHandler({ call, cfg, ledger, guard: withGuard ? guard : null })
+  return { cfg, daemon, store, guard, calls, call, obs, act, verify, ledger, session: 'unit' }
 }
 
 const findRef = (payload, name) => {
@@ -365,7 +372,7 @@ test('act: a removed element REFUSES with zero input; a covered one too', async 
   assert.equal(page.elements.some((e) => e.name === 'Where to?'), false, 'detached element is not offered')
 })
 
-test('act: covered and off-viewport targets refuse with the geometric reason', async () => {
+test('act: covered targets refuse; off-screen targets are scrolled into view ONCE, then executed', async () => {
   const { obs, act, session, daemon } = harness()
   const page = await obs({}, session)
   const ref = findRef(page, 'Where to?')
@@ -378,9 +385,51 @@ test('act: covered and off-viewport targets refuse with the geometric reason', a
   await daemon.call('evaluate', { code: 'mock:uncover' }, session)
   await daemon.call('evaluate', { code: 'mock:shift' }, session)
   await daemon.call('evaluate', { code: 'mock:shift' }, session)
+
+  // O-E: off-screen is no longer a dead end — one bounded scroll, then real input.
   const offscreen = await act({ ref, kind: 'click' }, session)
-  assert.equal(offscreen.reason_code, 'outside viewport')
-  assert.equal(offscreen.no_input_dispatched, true)
+  assert.equal(offscreen.executed, true, 'off-screen target is executed after being scrolled into view')
+  assert.equal(offscreen.scroll_attempts, 1)
+  assert.equal(offscreen.scrolled.trigger, 'outside viewport')
+  assert.equal(offscreen.delivered_target_matches, true)
+  const st = await state(daemon, session)
+  assert.equal(st.scrollAttempts, 1, 'exactly one scroll attempt, never a loop')
+  assert.equal(st.clicks.lastTarget, 'Where to?')
+})
+
+test('act: scroll:false refuses an off-screen target and dispatches nothing', async () => {
+  const { obs, act, session, daemon } = harness()
+  const page = await obs({}, session)
+  const ref = findRef(page, 'Where to?')
+  await daemon.call('evaluate', { code: 'mock:shift' }, session)
+  await daemon.call('evaluate', { code: 'mock:shift' }, session)
+  const refused = await act({ ref, kind: 'click', scroll: false }, session)
+  assert.equal(refused.reason_code, 'outside_viewport')
+  assert.equal(refused.scroll_mode, 'never')
+  assert.equal(refused.no_input_dispatched, true)
+  assert.match(refused.hint, /scroll:true/)
+  const st = await state(daemon, session)
+  assert.equal(st.scrollAttempts, 0)
+  assert.equal(st.clicks.any, 0)
+})
+
+test('act: a tab borrowed from the user is never scrolled implicitly (scroll:true opts in)', async () => {
+  const { obs, act, session, daemon, guard } = harness({ withGuard: true })
+  const page = await obs({}, session)
+  const ref = findRef(page, 'Where to?')
+  await daemon.call('evaluate', { code: 'mock:shift' }, session)
+  await daemon.call('evaluate', { code: 'mock:shift' }, session)
+  guard.bind(session, { url: 'https://user.test/app', source: 'find_tab', borrowed: true })
+
+  const implicit = await act({ ref, kind: 'click' }, session)
+  assert.equal(implicit.reason_code, 'outside_viewport')
+  assert.equal(implicit.scroll_mode, 'auto')
+  assert.match(implicit.hint, /borrowed tab/)
+  assert.equal((await state(daemon, session)).clicks.any, 0)
+
+  const explicit = await act({ ref, kind: 'click', scroll: true }, session)
+  assert.equal(explicit.executed, true)
+  assert.equal(explicit.scroll_attempts, 1)
 })
 
 test('act: a target that only MOVED is still hit (geometry is re-resolved, not trusted)', async () => {
@@ -689,4 +738,237 @@ test('resolveBudget default config: readConfig maps env knobs', async () => {
   assert.equal(cfg.mock, true)
   assert.equal(cfg.debug, true)
   assert.equal(readConfig({}).obsMaxChars, 4000)
+  // new knobs: scroll budget, verify budget, ledger path (and the "off" switch)
+  assert.equal(readConfig({}).actScrollTimeoutMs, ACTION_BUDGETS.act_scroll)
+  assert.equal(readConfig({}).verifyTimeoutMs, ACTION_BUDGETS.verify)
+  assert.match(readConfig({}).ledgerPath, /ops-ledger\.jsonl$/)
+  assert.equal(readConfig({ WEBBRIDGE_MCP_LEDGER: 'off' }).ledgerPath, null)
+  assert.equal(readConfig({ WEBBRIDGE_MCP_LEDGER: '/tmp/x.jsonl' }).ledgerPath, '/tmp/x.jsonl')
+})
+
+// ── ops ledger (O-F) ────────────────────────────────────────────────────────
+
+test('ledger index: only an UNKNOWN outcome marks a ref unresolved', () => {
+  const index = createLedgerIndex({ now: () => 1000 })
+  index.record({ session: 's', phase: 'intent', ref: 'o1:1', kind: 'click' })
+  index.record({ session: 's', phase: 'outcome', ref: 'o1:1', kind: 'click', verdict: 'ok', unknown_effects: false })
+  assert.equal(index.unresolved('s', 'o1:1'), null, 'a clean outcome resolves the ref')
+
+  index.record({ session: 's', phase: 'outcome', ref: 'o1:2', kind: 'fill', verdict: 'unknown', unknown_effects: true, reason_code: 'partial_input' })
+  assert.equal(index.unresolved('s', 'o1:2').reason_code, 'partial_input')
+  assert.equal(index.unresolved('s', 'o1:3'), null, 'an untouched ref is not unresolved')
+  assert.equal(index.unresolved('other', 'o1:2'), null, 'unresolved is per session')
+  assert.equal(index.unresolvedAll('s').length, 1)
+
+  // a later clean outcome on the SAME ref clears it (retry:true path)
+  index.record({ session: 's', phase: 'outcome', ref: 'o1:2', kind: 'fill', verdict: 'ok', unknown_effects: false })
+  assert.equal(index.unresolved('s', 'o1:2'), null)
+  assert.deepEqual(index.stats(), { events: 4, tracked_refs: 2 })
+
+  // a REFUSAL must not clear an unresolved outcome (it dispatched nothing): the
+  // gate that refuses a duplicate would otherwise lift itself.
+  index.record({ session: 's', phase: 'outcome', ref: 'o1:4', kind: 'click', verdict: 'unknown', unknown_effects: true })
+  index.record({ session: 's', phase: 'refused', ref: 'o1:4', kind: 'click', verdict: 'refused', unknown_effects: false })
+  assert.ok(index.unresolved('s', 'o1:4'), 'refusal keeps the unknown outcome visible')
+  index.record({ session: 's', phase: 'intent', ref: 'o1:4', kind: 'click' })
+  assert.ok(index.unresolved('s', 'o1:4'), 'an intent alone is not an outcome')
+})
+
+test('ledger: a partial dispatch blocks a repeat on the same ref; a re-observation or retry:true unblocks it', async () => {
+  const base = createMockCall()
+  let failRelease = true
+  const mock = (action, args, session) => {
+    if (failRelease && action === 'cdp' && args.method === 'Input.dispatchMouseEvent' && args.params?.type === 'mouseReleased') {
+      return { __error: 'connection reset mid-input' }
+    }
+    return base(action, args, session)
+  }
+  const { obs, act, session, daemon, ledger } = harness({ mock })
+  const page = await obs({}, session)
+  const ref = findRef(page, 'Search')
+
+  const first = await act({ ref, kind: 'click' }, session)
+  assert.equal(first.ok, false)
+  assert.equal(first.unknown_effects, true, 'press landed, release did not → the effect is UNKNOWN')
+  assert.ok(first.input_dispatched > 0)
+  const after = await state(daemon, session)
+  assert.equal(after.clicks.any, 1)
+
+  // same ref, no re-observation → refuse, and dispatch NOTHING new
+  const again = await act({ ref, kind: 'click' }, session)
+  assert.equal(again.reason_code, 'duplicate_after_unknown')
+  assert.equal(again.no_input_dispatched, true)
+  assert.equal(again.previous.reason_code, null)
+  assert.ok(Array.isArray(again.remedies) && again.remedies.length >= 2)
+  assert.equal((await state(daemon, session)).clicks.any, 1, 'no second click was dispatched')
+
+  // the sanctioned retry: re-observe (new generation → new ref) and act on that
+  failRelease = false
+  const fresh = await obs({}, session)
+  const ref2 = findRef(fresh, 'Search')
+  assert.notEqual(ref2, ref)
+  const second = await act({ ref: ref2, kind: 'click' }, session)
+  assert.equal(second.executed, true)
+  assert.equal(second.delivered_target_matches, true)
+
+  // the old ref is still unresolved; retry:true is the explicit escape hatch
+  const forced = await act({ ref, kind: 'click', retry: true }, session)
+  assert.equal(forced.executed, true)
+  assert.equal(forced.retried_after_unknown, true)
+  assert.match(forced.retried_note, /UNKNOWN/)
+
+  // the ledger tells the story: intent/outcome pairs plus the refusal
+  const entries = ledger.entries(session, 20)
+  const phases = entries.map((e) => e.phase)
+  assert.ok(phases.includes('intent') && phases.includes('outcome') && phases.includes('refused'))
+  assert.equal(ledger.unresolved(session, ref), null, 'the forced retry closed the unknown outcome')
+  assert.ok(entries.some((e) => e.verdict === 'unknown'))
+})
+
+test('ledger: survives a restart by replaying the file (an unknown outcome stays blocked)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-ledger-'))
+  const path = join(dir, 'ops-ledger.jsonl')
+  try {
+    const first = createOpsLedger({ path })
+    const intent = first.begin({ session: 's', ref: 'o1:9', kind: 'click' })
+    first.finish(intent.id, { session: 's', ref: 'o1:9', kind: 'click', verdict: 'unknown', unknown_effects: true, reason_code: 'partial_input' })
+    first.verified({ session: 's', passed: false, failed: ['total'] })
+
+    const second = createOpsLedger({ path })     // a fresh process
+    assert.ok(second.hydrated_events >= 3)
+    assert.equal(second.unresolved('s', 'o1:9').reason_code, 'partial_input')
+    const lines = readFileSync(path, 'utf8').trim().split('\n')
+    assert.equal(lines.length, 3)
+    assert.equal(JSON.parse(lines[0]).phase, 'intent')
+    assert.equal(JSON.parse(lines[2]).phase, 'verify')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('ledger: a broken path never breaks the tool (best-effort, reported once)', () => {
+  const ledger = createOpsLedger({ path: '/dev/null/nope/ledger.jsonl' })
+  const intent = ledger.begin({ session: 's', ref: 'o1:1', kind: 'click' })
+  assert.ok(intent.id)
+  assert.equal(ledger.unresolved('s', 'o1:1'), null, 'still usable in memory')
+})
+
+// ── verify (O-G) ────────────────────────────────────────────────────────────
+
+test('verify: a checklist passes, fails with evidence, and mutates nothing', async () => {
+  const { obs, act, verify, session, daemon, ledger } = harness()
+  const page = await obs({}, session)
+  const ref = findRef(page, 'Where to?')
+  await act({ ref, kind: 'fill', text: 'Lisbon' }, session)
+  const clicksBefore = (await state(daemon, session)).clicks.any
+
+  const pass = await verify({
+    checks: [
+      { name: 'url', url: { op: 'contains', value: 'mock.test/fixture' } },
+      { name: 'destination', value: { ref, op: 'equals', value: 'Lisbon' } },
+      { name: 'search button', element: { css: '[name="Search"]', op: 'present' } },
+      { name: 'no error banner', text: { op: 'absent', value: 'Something went wrong' } },
+      { name: 'controls present', count: { css: '*', op: 'gte', value: 5 } },
+    ],
+  }, session)
+  assert.equal(pass.ok, true)
+  assert.equal(pass.passed, true)
+  assert.equal(pass.verdict, 'PASS')
+  assert.deepEqual(pass.failed, [])
+  assert.equal(pass.round_trips, 1)
+  assert.equal(pass.checks.length, 5)
+
+  const fail = await verify({ checks: [{ name: 'destination is Zurich', value: { ref, op: 'equals', value: 'Zurich' } }] }, session)
+  assert.equal(fail.ok, true, 'a failed check is a successful verification')
+  assert.equal(fail.passed, false)
+  assert.deepEqual(fail.failed, ['destination is Zurich'])
+  assert.equal(fail.checks[0].actual, 'Lisbon')
+  assert.match(fail.checks[0].error, /expected equals "Zurich"/)
+  assert.match(fail.hint, /NOT finished/)
+
+  assert.equal((await state(daemon, session)).clicks.any, clicksBefore, 'verify dispatches no input')
+  const verdicts = ledger.entries(session, 20).filter((e) => e.phase === 'verify')
+  assert.deepEqual(verdicts.map((v) => v.verdict), ['pass', 'fail'])
+})
+
+test('verify: regex and absent-element checks behave, and repeated clean acts are never gated', async () => {
+  const { obs, act, verify, session, daemon } = harness()
+  const page = await obs({}, session)
+  const ref = findRef(page, 'Search')
+
+  const regex = await verify({
+    checks: [
+      { name: 'url regex', url: { op: 'regex', value: 'mock\\.test/fix' } },
+      { name: 'no danger banner', element: { css: '.alert-danger', op: 'absent' } },
+    ],
+  }, session)
+  assert.equal(regex.passed, true, JSON.stringify(regex.failed))
+  const missingAbsent = await verify({ checks: [{ name: 'absent but present', element: { css: '[name="Search"]', op: 'absent' } }] }, session)
+  assert.equal(missingAbsent.passed, false)
+  assert.match(missingAbsent.checks[0].error, /is present/)
+
+  // the duplicate gate is about UNKNOWN outcomes only: two clean clicks in a row
+  // on the same ref must both execute (a normal repeated action).
+  const first = await act({ ref, kind: 'click' }, session)
+  const second = await act({ ref, kind: 'click' }, session)
+  assert.equal(first.executed, true)
+  assert.equal(second.executed, true)
+  assert.equal(second.reason_code, undefined)
+  assert.equal((await state(daemon, session)).clicks.any, 2, 'both clean clicks landed')
+})
+
+test('verify: bad specs, unresolvable refs and timeouts are UNKNOWN, never a pass', async () => {
+  const { verify, obs, session } = harness()
+  const empty = await verify({ checks: [] }, session)
+  assert.equal(empty.passed, false)
+  assert.equal(empty.unknown, true)
+  assert.equal(empty.reason_code, 'invalid_checks')
+
+  const twoKinds = await verify({ checks: [{ url: { value: 'x' }, text: { value: 'y' } }] }, session)
+  assert.equal(twoKinds.reason_code, 'invalid_checks')
+  assert.match(twoKinds.reason, /exactly one of/)
+
+  const badOp = await verify({ checks: [{ url: { op: 'startsWith', value: 'x' } }] }, session)
+  assert.equal(badOp.reason_code, 'invalid_checks')
+  assert.match(badOp.reason, /op must be one of prefix\/contains\/equals\/regex/)
+
+  const noTarget = await verify({ checks: [{ value: { op: 'equals', value: 'x' } }] }, session)
+  assert.equal(noTarget.reason_code, 'invalid_checks')
+
+  const tooMany = await verify({ checks: Array.from({ length: 51 }, () => ({ url: { value: 'x' } })) }, session)
+  assert.equal(tooMany.reason_code, 'invalid_checks')
+
+  await obs({}, session)
+  const staleRef = await verify({ checks: [{ name: 'ghost', value: { ref: 'o9:99', op: 'equals', value: 'x' } }] }, session)
+  assert.equal(staleRef.ok, true)
+  assert.equal(staleRef.passed, false)
+  assert.match(staleRef.checks[0].error, /not resolvable/)
+
+  // a transport timeout is reported as unknown, not as a pass
+  const timedOut = await createVerifyHandler({
+    call: async () => ({ ok: false, error: { code: 'timeout', message: 'budget exceeded' }, timedOut: true, budgetMs: 12_000, unknownEffects: false, action: 'evaluate' }),
+    cfg: { verifyTimeoutMs: 12_000, debug: false },
+    ledger: createOpsLedger({ path: null }),
+  })({ checks: [{ url: { value: 'x' } }] }, 'unit')
+  assert.equal(timedOut.passed, false)
+  assert.equal(timedOut.unknown, true)
+  assert.equal(timedOut.reason_code, 'verify_timeout')
+  assert.match(timedOut.reason, /UNKNOWN, not a pass/)
+})
+
+test('verify: validateChecks accepts the documented ops and rejects the rest', () => {
+  assert.equal(validateChecks([{ url: { value: 'x' } }]).checks.length, 1)
+  assert.equal(validateChecks([{ name: 'v', value: { ref: 'o1:2', value: 'x' } }]).checks[0].name, 'v')
+  assert.equal(validateChecks([{ value: { css: '#a', value: 'x' } }]).checks[0].value.css, '#a')
+  assert.match(validateChecks('nope').error, /non-empty array/)
+  assert.match(validateChecks([{}]).error, /exactly one of/)
+  assert.match(validateChecks([{ element: { op: 'visible' } }]).error, /op must be one of present\/absent/)
+  assert.deepEqual(Object.keys(CHECK_KINDS), ['url', 'text', 'value', 'element', 'count'])
+})
+
+test('act: the scroll snippet renders the node id and never exposes other page state', () => {
+  const code = scrollIntoViewCode(42)
+  assert.match(code, /get\(42\)/)
+  assert.match(code, /__wb:scrollIntoView/)
+  assert.equal(scrollIntoViewCode(7).includes('NODE_PLACEHOLDER'), false)
 })

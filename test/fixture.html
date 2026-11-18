@@ -80,6 +80,11 @@
     const el = document.getElementById('probe');
     el.dataset.clicks = String(Number(el.dataset.clicks || 0) + 1);
   });
+  // Below the fold: the target of the "scroll into view once" case. The status
+  // line makes the click independently verifiable (a `verify` check reads it).
+  document.getElementById('offscreen').addEventListener('click', () => {
+    document.getElementById('status').textContent = 'reached the fold';
+  });
 
   // ── mutation helpers (used to make observations stale on purpose) ─────────
   window.__renameGo = (text) => {

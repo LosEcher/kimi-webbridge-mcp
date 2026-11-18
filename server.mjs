@@ -36,6 +36,8 @@ import { createObsStore } from './lib/refs.mjs'
 import { createSessionGuard } from './lib/sessions.mjs'
 import { createObsHandler } from './lib/obs.mjs'
 import { createActHandler } from './lib/act.mjs'
+import { createVerifyHandler } from './lib/verify.mjs'
+import { createOpsLedger } from './lib/ledger.mjs'
 import { openTab } from './lib/tabs.mjs'
 import { createMockCall } from './lib/mock-daemon.mjs'
 
@@ -93,9 +95,59 @@ const TOOLS = [
         settle_ms: { type: 'integer', description: 'Bounded settle after dispatch, in ms (default 40).' },
         verify_delivery: { type: 'boolean', description: 'Verify that the pointer event actually reached the intended element (default true).' },
         refresh: { type: 'boolean', description: 'On a drift/detached refusal, include a fresh observation in the response (default true).' },
+        scroll: {
+          type: 'boolean',
+          description:
+            'Whether act may scroll an off-screen target into view (one attempt, bounded). ' +
+            'Default (absent) = auto: allowed on a tab this session owns, skipped when the working tab was borrowed from the user. ' +
+            'true forces it, false forbids it (useful on lazy-loading pages where a jump would skip content).',
+        },
+        retry: {
+          type: 'boolean',
+          description:
+            'Force a repeat dispatch of a ref whose previous attempt ended with an UNKNOWN effect. Without it, act refuses (duplicate_after_unknown) — ' +
+            'the sanctioned retry is to re-observe with obs first (a new ref = a new decision against a re-read page). Retries are recorded in the ledger.',
+        },
         session: SESSION_ARG,
       },
       required: ['ref'],
+    },
+  },
+  {
+    name: 'verify',
+    description:
+      'Check mechanically that a task actually finished — ONE page read, nothing mutated. ' +
+      'A failed check answers ok:true, passed:false with the exact expected/actual pair, i.e. "the task is NOT done". ' +
+      'An unrunnable check (bad spec, unresolvable ref, timeout) answers passed:false + unknown:true and is NEVER reported as a pass. ' +
+      'Call this before claiming DONE and after any batch that writes data; the verdict is written to the ops ledger. ' +
+      'Checks: url {op:prefix|contains|equals|regex, value}; text {op:contains|absent|equals, value, selector?}; ' +
+      'value {ref|css, op:equals|contains, value}; element {ref|css, op:present|absent}; count {css, op:gte|lte|eq, value}. ' +
+      'Prefer ref (from obs) over css; css must match exactly one element.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        checks: {
+          type: 'array',
+          description: 'Non-empty list of checks (at most 50). Each item has a `name` and exactly one of url/text/value/element/count.',
+          items: { type: 'object', additionalProperties: true },
+        },
+        session: SESSION_ARG,
+      },
+      required: ['checks'],
+    },
+  },
+  {
+    name: 'ledger',
+    description:
+      'Read this session\u2019s ops ledger (read-only): which actions were dispatched, which were refused, which mutations ended with an UNKNOWN effect ' +
+      '(a timeout or partial input whose result must be re-read before any retry), and the latest verify verdicts. ' +
+      'Use it after an interruption or a timeout to find out what the agent already touched.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', description: 'How many recent entries to return (default 20, max 200).' },
+        session: SESSION_ARG,
+      },
     },
   },
   {
@@ -298,13 +350,39 @@ const daemon = createDaemonClient({
 })
 const store = createObsStore()
 const guard = createSessionGuard()
+const ledger = createOpsLedger({ path: cfg.mock ? null : cfg.ledgerPath, debug: cfg.debug })
 const obs = createObsHandler({ call: daemon.call, store, cfg, guard })
-const act = createActHandler({ call: daemon.call, store, cfg, obs, guard })
+const act = createActHandler({ call: daemon.call, store, cfg, obs, guard, ledger })
+const verify = createVerifyHandler({ call: daemon.call, cfg, ledger, guard })
+
+/** Keep ledger entries small enough to be read back by a model. */
+function summarizeLedgerEntry(entry) {
+  return {
+    id: entry.id, at: new Date(entry.ts).toISOString(), phase: entry.phase, op: entry.op ?? null,
+    ref: entry.ref ?? null, kind: entry.kind ?? null, verdict: entry.verdict ?? null,
+    unknown_effects: entry.unknown_effects === true,
+    reason_code: entry.reason_code ?? null,
+    reason: entry.reason ? String(entry.reason).slice(0, 200) : null,
+    ms: entry.ms ?? null,
+  }
+}
 
 /** Tools implemented by this server itself (not a straight daemon passthrough). */
 async function callNative(name, args, session) {
   if (name === 'obs') return obs(args, session)
   if (name === 'act') return act(args, session)
+  if (name === 'verify') return verify(args, session)
+  if (name === 'ledger') {
+    const limit = Number.isFinite(args.limit) ? Math.max(1, Math.min(200, Number(args.limit))) : 20
+    return {
+      ok: true,
+      path: ledger.path,
+      hydrated_events: ledger.hydrated_events,
+      stats: ledger.stats(),
+      unresolved: ledger.unresolvedAll(session).map(summarizeLedgerEntry),
+      entries: ledger.entries(session, limit).map(summarizeLedgerEntry),
+    }
+  }
   if (name === 'open_tab') {
     return openTab(daemon.call, session, {
       url: args.url,
@@ -382,7 +460,7 @@ async function handle(message) {
     return rpcResult(message.id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: 'kimi-webbridge-mcp', version: '1.1.0' },
+      serverInfo: { name: 'kimi-webbridge-mcp', version: '1.2.0' },
     })
   }
   if (message.method === 'ping') return rpcResult(message.id, {})
@@ -411,7 +489,7 @@ async function handle(message) {
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 
-process.stderr.write(`[webbridge-mcp] ready v1.1.0 (daemon: ${cfg.daemonUrl}${cfg.mock ? ' [MOCK]' : ''}, session default: ${cfg.defaultSession})\n`)
+process.stderr.write(`[webbridge-mcp] ready v1.2.0 (daemon: ${cfg.daemonUrl}${cfg.mock ? ' [MOCK]' : ''}, session default: ${cfg.defaultSession})\n`)
 
 const lines = createInterface({ input: process.stdin })
 for await (const line of lines) {

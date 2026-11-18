@@ -9,7 +9,35 @@
 > **不装 DSH**。本仓库补上 DSH（及任意 MCP 客户端）这一环，且工具带 JSON Schema，
 > 优于纯文本 skill 调用。
 
-## v1.1.0：守卫化快环（obs / act / open_tab）
+## v1.2.0：把「别重复写」和「DONE 不自证」变成机制（verify / ledger / 预滚）
+
+v1.1.0 解决的是「点错元素却报成功」；这一版解决另外两类真实事故：
+
+| 新东西 | 做什么 |
+|---|---|
+| **`verify`** | **独立结果校验**：declarative checklist（`url` / `text` / `value` / `element` / `count`）在**一次页内读取**里跑完，**不改任何东西**。检查失败返回 `ok:true, passed:false` + 每条检查的 expected/actual ——「任务没完成」是**成功的验证**，不是工具错误；规格非法/ref 解析不了/超时返回 `passed:false + unknown:true`，**永不**被当成通过。 |
+| **`ledger`** | 本会话的**操作台账**（只读）：派发过什么、拒绝过什么、哪些变更的**结果未知**（超时/部分输入）、`verify` 的判决。中断或超时之后，用它回答「到底已经动过什么」。 |
+| **`act` 预滚** | 离屏目标不再直接放弃：**有界一次** `scrollIntoView({block:'center'})` → 重新解析几何 → 再复核 → 才派发输入（实测这条路径是脚本化驱动里最贵的一步：轮盘滚动 10–20 s vs 先滚入 ~96 ms）。`scroll:false` 可禁用；**借用用户的标签默认不滚**（那会移动用户自己的页面），要滚得显式 `scroll:true`。 |
+| **`act` 幂等闸门** | 同一 ref 的上一次尝试若以**未知结果**收尾（`partial_input` / 超时 / 填了但读回不一致），再次 `act` 该 ref 会被拒绝：`reason_code:"duplicate_after_unknown"` + 零派发。正路是**重新 `obs`**（新 ref = 对新页面的新决策）；`retry:true` 是显式逃生口，且会被记进台账。 |
+
+台账落在 `~/.dsh/storages/kimi-webbridge-mcp/ops-ledger.jsonl`（append-only JSONL，写失败只在 stderr 提示一次，**绝不让记账失败拖垮动作**；`WEBBRIDGE_MCP_LEDGER=off` 可整体关闭）。
+重启后从文件尾部回放，所以「上一次进程留下的未知结果」在新进程里依然会拦住重复派发。
+
+`verify` 的检查形状（`checks` 数组，最多 50 条，每条一个 kind）：
+
+```jsonc
+{ "checks": [
+  { "name": "url",        "url":     { "op": "prefix",   "value": "https://app.example.com/orders" } },
+  { "name": "saved",      "text":    { "op": "contains", "value": "Saved", "selector": "#status" } },
+  { "name": "amount",     "value":   { "ref": "o3:17",   "op": "equals",   "value": "1200.00" } },
+  { "name": "no error",   "element": { "css": ".alert-danger", "op": "absent" } },
+  { "name": "row count",  "count":   { "css": "#rows tr", "op": "gte", "value": 1 } }
+] }
+```
+
+`ref` 优先（它绑定的是决策时的那个元素）；`css` 是显式逃生口，且必须**唯一命中**一个元素。
+
+### v1.1.0：守卫化快环（obs / act / open_tab）
 
 这一版补上三件事，用来修「agent 说点了、也报成功、页面没动」和「navigate 挂死」这两个真实痛点：
 
